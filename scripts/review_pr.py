@@ -620,6 +620,12 @@ def build_review_prompt(
            issues. Only report a dependency issue if it is task-specific,
            blocks the core domain workflow, and is not something the shared
            benchmark runtime should reasonably provide.
+        8. Do not require every task bundle to implement generic PDF parsing,
+           image inspection, or generic file-reading tools if those are shared
+           runtime capabilities and the source files are included. Only flag
+           source-access issues when the task relies on paper-specific or
+           source-specific values that are not reachable from released data,
+           included source content, or a reasonable generic parsing path.
 
         Review dimensions:
 
