@@ -47,15 +47,18 @@ REVIEW_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": [
         "task_id",
+        "model",
         "overall_status",
         "benchmark_fit",
         "summary",
+        "reasoning",
         "findings",
         "merge_candidates",
-        "recommended_next_steps",
+        "todo_items",
     ],
     "properties": {
         "task_id": {"type": "string"},
+        "model": {"type": "string"},
         "overall_status": {
             "type": "string",
             "enum": [
@@ -70,6 +73,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
             "enum": ["good", "borderline", "poor"],
         },
         "summary": {"type": "string"},
+        "reasoning": {"type": "string"},
         "findings": {
             "type": "array",
             "items": {
@@ -132,7 +136,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
                 },
             },
         },
-        "recommended_next_steps": {
+        "todo_items": {
             "type": "array",
             "items": {"type": "string"},
         },
@@ -172,6 +176,7 @@ def main() -> int:
     pr = repo.get_pull(pr_number)
     head_repo = pr.head.repo or repo
     head_ref = pr.head.sha
+    base_ref = pr.base.sha
 
     changed_files = [
         ChangedFile(path=file.filename, status=file.status)
@@ -189,17 +194,24 @@ def main() -> int:
 
     llm_api_key = require_env("LLM_API_KEY")
     llm_base_url = os.getenv("LLM_BASE_URL") or None
-    llm_model = os.getenv("LLM_MODEL", "gpt-5.4")
+    llm_models = parse_review_models(os.getenv("LLM_REVIEW_MODELS"))
     client = OpenAI(api_key=llm_api_key, base_url=llm_base_url)
     records = []
     for target in targets:
         try:
             snapshot = collect_target_snapshot(target, changed_files, head_repo, head_ref)
-            prompt = build_review_prompt(target, snapshot, changed_files)
-            record = call_review_model(client, llm_model, prompt)
+            base_snapshot = collect_base_snapshot(target, repo, base_ref)
+            prompt = build_review_prompt(target, snapshot, base_snapshot, changed_files)
+            for model in llm_models:
+                try:
+                    record = call_review_model(client, model, prompt)
+                except Exception as exc:
+                    record = failed_review_record(target, model, exc)
+                records.append(normalize_record(target, model, record))
         except Exception as exc:
-            record = failed_review_record(target, exc)
-        records.append(normalize_record(target, record))
+            for model in llm_models:
+                record = failed_review_record(target, model, exc)
+                records.append(normalize_record(target, model, record))
 
     post_comment(pr, build_review_comment(pr_number, records, targets))
     return 0
@@ -210,6 +222,11 @@ def require_env(name: str) -> str:
     if not value:
         raise SystemExit(f"Missing required environment variable: {name}")
     return value
+
+
+def parse_review_models(raw: str | None) -> list[str]:
+    models = [item.strip() for item in (raw or "").split(",") if item.strip()]
+    return models or ["gpt-5.5", "claude-opus-4.7"]
 
 
 def detect_task_targets(
@@ -303,6 +320,34 @@ def collect_target_snapshot(
     if target.kind == "directory":
         return snapshot_directory(head_repo, target.path, ref, changed_paths)
     raise ValueError(f"Unsupported target kind: {target.kind}")
+
+
+def collect_base_snapshot(
+    target: TaskTarget,
+    base_repo: Any,
+    base_ref: str,
+) -> list[FileSnapshot]:
+    try:
+        if target.kind == "zip":
+            raw = fetch_file_bytes(base_repo, target.path, base_ref)
+            snapshots = snapshot_zip(target.path, raw, set())
+        elif target.kind == "directory":
+            if not github_path_exists(
+                base_repo,
+                f"{target.path}/task_content/task_content.json",
+                base_ref,
+            ):
+                return []
+            snapshots = snapshot_directory(base_repo, target.path, base_ref, set())
+        else:
+            return []
+    except Exception:
+        return []
+
+    for item in snapshots:
+        item.path = f"BASE_BRANCH/{item.path}"
+        item.changed = False
+    return snapshots
 
 
 def fetch_file_bytes(repo: Any, path: str, ref: str) -> bytes:
@@ -457,9 +502,11 @@ def fetch_text_snapshot(repo: Any, path: str, ref: str) -> tuple[str | None, int
 def build_review_prompt(
     target: TaskTarget,
     snapshot: list[FileSnapshot],
+    base_snapshot: list[FileSnapshot],
     changed_files: list[ChangedFile],
 ) -> str:
     file_context = render_file_context(snapshot)
+    base_context = render_file_context(base_snapshot)
     changed_context = "\n".join(f"- {item.status}: {item.path}" for item in changed_files)
     schema_text = json.dumps(REVIEW_SCHEMA, indent=2)
     prompt = textwrap.dedent(
@@ -480,6 +527,10 @@ def build_review_prompt(
         File context for the detected task target:
         {file_context}
 
+        Base-branch context for the same target, if it already existed before
+        this PR:
+        {base_context}
+
         Your goal is to identify real data-quality or task-quality problems
         that should be fixed before this task is merged. Do not nitpick. Focus
         on issues that would make the task content invalid, unsupported by the
@@ -490,8 +541,8 @@ def build_review_prompt(
 
         1. Do not flag task_content.json for containing expected answers,
            checklists, scoring rubrics, or expected artifacts. In our benchmark
-           runner, the model only receives the model-facing ask field, not the
-           full task folder.
+           runner, the model only receives the model-facing instruction/ask
+           field, not the full task folder.
         2. Do not flag generic utility tools with pass, NotImplemented, or
            placeholder bodies if they are clearly shared-framework utilities,
            such as read_excel, read_csv, read_parquet, search, generic file
@@ -500,7 +551,10 @@ def build_review_prompt(
         3. Do not require the task to reproduce every part of the original
            paper. A task is acceptable if it is derived from the paper, the
            question is reasonable, and the expected answer/checklist matches
-           what the question asks.
+           what the question asks. However, the task must still cover the main
+           scientific thread or central result that it claims to evaluate; do
+           not accept a task that only samples a marginal side detail while the
+           answer/checklist claims the paper's main contribution.
         4. Do not judge whether the task absolutely requires tool use. We are
            not rejecting tasks just because a strong model could also solve
            parts with code. Focus on whether the released data and tools support
@@ -521,11 +575,23 @@ def build_review_prompt(
         Review dimensions:
 
         A. Task content validity
-        - Is the ask clear and content-wise coherent?
+        - Is the instruction/ask clear and content-wise coherent?
+        - Is the instruction/ask appropriately fuzzy: it should state what the
+          model needs to accomplish without revealing detailed step-by-step
+          execution instructions, exact analysis commands, or answer-producing
+          implementation details. Do not be overly strict; only flag this when
+          the instruction clearly says things like "first do X, then run Y, then
+          compute Z" in a way that removes the need for agent planning.
         - Is the task aligned with the source paper or source study it appears
           to come from?
+        - Does the task cover the paper/source's main scientific thread at an
+          appropriate scope, rather than an isolated detail that misses the
+          central result?
         - Does the expected answer/checklist answer the same question that the
-          ask asks?
+          instruction/ask asks?
+        - Do the instruction/ask, expected answer/checklist, released data, and
+          source paper all point to the same scientific claim, variables,
+          dataset, cohort/object, method, and output artifacts?
         - Are the requested outputs and conclusions supported by the released
           input data?
         - Does the task ask for claims, comparisons, variables, cohorts,
@@ -534,9 +600,18 @@ def build_review_prompt(
           actual files, such as wrong year ranges, units, dataset names, cohort
           names, or missing required inputs?
 
+        Flag as high severity if the task question and expected answer do not
+        match, if the task/answer is not aligned with the source paper's main
+        claim for the chosen scope, if released data cannot support the
+        requested conclusion, or if the task seems scientifically/content-wise
+        invalid.
+
         B. Core answer and core figure/artifact coverage
         - Does the checklist or expected answer cover the core conclusion(s)
           the task is asking for?
+        - Do the answer weights or checklist items prioritize the central
+          scientific conclusion, not only surface artifacts or peripheral
+          details?
         - If the task asks for figures or artifacts, do the expected
           figure/artifact points correspond to the core finding rather than
           irrelevant side outputs?
@@ -547,11 +622,37 @@ def build_review_prompt(
           receive substantial credit because the checklist misses the main
           scientific point?
 
-        C. Tool and data support
+        Flag as high severity only if the scoring target is fundamentally
+        misaligned with the task. Use medium severity for missing but fixable
+        core checklist or figure points.
+
+        C. Source-paper alignment
+
+        If the bundle includes a reference paper, source PDF, README, extracted
+        text, or citation metadata, use it to check:
+        - Whether the task instruction faithfully represents the paper/source.
+        - Whether the expected answer/checklist includes the central
+          paper-supported conclusion for the scoped task.
+        - Whether quoted numbers, named figures, units, periods, thresholds,
+          cohorts, materials, samples, or variables match the source.
+        - Whether released data/tools provide enough evidence for the model to
+          reproduce or justify the requested source-aligned conclusion.
+
+        Flag as high severity for paper/source-answer contradictions, invented
+        claims, wrong key numbers, wrong figure mapping, or a task that asks for
+        a conclusion the source does not support. Use medium severity when the
+        source alignment is mostly correct but missing an important caveat,
+        uncertainty, or supporting evidence from the source.
+
+        D. Tool and data support
         Audit whether the provided domain-specific tools and released files can
         support the task. Focus on:
         - Domain tools that are too weak, brittle, incomplete, or internally
           inconsistent for the instructed workflow.
+        - Tool granularity: tools should be composable domain primitives that
+          expose useful analysis operations, not only low-level file I/O and not
+          one-click functions that directly return the final report, final
+          conclusion, or hidden answer.
         - Tool functions that do not compose correctly, such as one function
           returning a schema that another function cannot consume.
         - Tools that are too one-shot or too paper-specific, especially if they
@@ -565,6 +666,42 @@ def build_review_prompt(
         - Missing data-alignment logic, such as column aliases, metadata joins,
           file manifests, sample ID mapping, cohort mapping, country mapping, or
           chronology-to-parameter mapping.
+
+        For tools that are not general enough:
+        - If the tool can be naturally split into reusable steps using the
+          existing code and data, recommend generalization or splitting.
+        - If the tool hides final answers, hard-coded scientific thresholds, or
+          paper-specific conclusions that cannot be justified from released data,
+          flag it as a task/data-provider issue.
+
+        E. Bundle hygiene
+
+        Check for avoidable packaging problems that would make review,
+        execution, or merge harder:
+        - Generated caches or transient files, such as `__pycache__`, `.pyc`,
+          notebook checkpoint folders, logs, scratch files, or temporary outputs.
+        - Local absolute paths, machine-specific paths, or references to files
+          outside the task bundle.
+        - Executed notebook outputs that reveal answers or make the notebook
+          non-clean as a source artifact.
+        - Hidden-answer leakage in tool names, docstrings, README text,
+          parameter names, return fields, or comments.
+        - Undeclared task-specific dependencies that are needed for the core
+          workflow.
+
+        Use low or medium severity for ordinary hygiene issues. Use high
+        severity only if the issue leaks the answer, blocks task execution, or
+        makes the released bundle scientifically ambiguous.
+
+        Comparison with current active task root:
+        If this PR updates an existing task already present on the base branch:
+        - Identify net-new useful domain tools or functions.
+        - Identify regressions, duplicated low-quality tools, or tools that
+          should not be merged.
+        - For each merge candidate, say whether it can be merged as-is, needs
+          generalization, needs splitting, or should not be merged.
+        If no base-branch version is included in the file context, do not invent
+        a comparison.
 
         Severity guidance:
         - high: principle-level issue that should be fixed by the data provider,
@@ -580,7 +717,12 @@ def build_review_prompt(
 
         Be concrete. Reference file paths, tool file names, and function names
         in the evidence strings. Keep the summary short and factual.
-        Only report findings that fit the review dimensions above.
+        Only report findings that fit the review dimensions above. If an issue
+        is outside this scope, ignore it.
+
+        Put the detailed rationale in `reasoning`. Put concise actionable TODOs
+        in `todo_items`; these TODOs will be shown outside the folded detail
+        block in the GitHub PR comment.
 
         Return only valid JSON matching this schema:
         {schema_text}
@@ -615,12 +757,14 @@ def call_review_model(client: OpenAI, model: str, prompt: str) -> dict[str, Any]
         response = client.chat.completions.create(
             model=model,
             messages=messages,
+            temperature=0.3,
             response_format={"type": "json_object"},
         )
     except Exception:
         response = client.chat.completions.create(
             model=model,
             messages=messages,
+            temperature=0.3,
         )
     text = response.choices[0].message.content or "{}"
     return parse_json_response(text)
@@ -640,12 +784,14 @@ def parse_json_response(text: str) -> dict[str, Any]:
         raise
 
 
-def failed_review_record(target: TaskTarget, exc: BaseException) -> dict[str, Any]:
+def failed_review_record(target: TaskTarget, model: str, exc: BaseException) -> dict[str, Any]:
     return {
         "task_id": target.task_id,
+        "model": model,
         "overall_status": "needs_major_rework",
         "benchmark_fit": "poor",
         "summary": f"Automated review failed: {type(exc).__name__}: {exc}",
+        "reasoning": "The reviewer could not complete because the model call or file collection failed.",
         "findings": [
             {
                 "severity": "high",
@@ -656,27 +802,29 @@ def failed_review_record(target: TaskTarget, exc: BaseException) -> dict[str, An
             }
         ],
         "merge_candidates": [],
-        "recommended_next_steps": ["Fix the review execution issue and rerun the workflow."],
+        "todo_items": ["Fix the review execution issue and rerun the workflow."],
     }
 
 
-def normalize_record(target: TaskTarget, record: dict[str, Any]) -> dict[str, Any]:
+def normalize_record(target: TaskTarget, model: str, record: dict[str, Any]) -> dict[str, Any]:
+    findings = record.get("findings") if isinstance(record.get("findings"), list) else []
+    todo_items = record.get("todo_items")
+    if not isinstance(todo_items, list):
+        todo_items = derive_todos(findings)
     normalized = {
         "task_id": str(record.get("task_id") or target.task_id),
+        "model": str(record.get("model") or model),
         "overall_status": str(record.get("overall_status") or "needs_major_rework"),
         "benchmark_fit": str(record.get("benchmark_fit") or "poor"),
         "summary": str(record.get("summary") or ""),
-        "findings": record.get("findings") if isinstance(record.get("findings"), list) else [],
+        "reasoning": str(record.get("reasoning") or ""),
+        "findings": findings,
         "merge_candidates": (
             record.get("merge_candidates")
             if isinstance(record.get("merge_candidates"), list)
             else []
         ),
-        "recommended_next_steps": (
-            record.get("recommended_next_steps")
-            if isinstance(record.get("recommended_next_steps"), list)
-            else []
-        ),
+        "todo_items": [str(item) for item in todo_items],
         "_target": {"kind": target.kind, "path": target.path},
     }
     if normalized["overall_status"] not in {
@@ -691,6 +839,18 @@ def normalize_record(target: TaskTarget, record: dict[str, Any]) -> dict[str, An
     return normalized
 
 
+def derive_todos(findings: list[dict[str, Any]]) -> list[str]:
+    todos = []
+    for finding in findings:
+        title = str(finding.get("title") or "").strip()
+        action = str(finding.get("recommended_action") or "").strip()
+        if title and action:
+            todos.append(f"{title}: {action}")
+        elif action:
+            todos.append(action)
+    return todos or ["No blocking TODOs identified by this reviewer."]
+
+
 def build_review_comment(
     pr_number: int,
     records: list[dict[str, Any]],
@@ -700,15 +860,16 @@ def build_review_comment(
         REVIEW_COMMENT_MARKER,
         f"## MCP Tool Use Data Review for PR #{pr_number}",
         "",
-        "| Task | Target | Status | Fit | High | Medium | Low | Summary |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | --- |",
+        "| Task | Model | Target | Status | Fit | High | Medium | Low | Summary |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
     ]
     for record in records:
         counts = severity_counts(record.get("findings", []))
         target = record.get("_target", {})
         lines.append(
-            "| {task} | `{kind}:{path}` | `{status}` | `{fit}` | {high} | {medium} | {low} | {summary} |".format(
+            "| {task} | `{model}` | `{kind}:{path}` | `{status}` | `{fit}` | {high} | {medium} | {low} | {summary} |".format(
                 task=escape_md(record["task_id"]),
+                model=escape_md(record["model"]),
                 kind=escape_md(target.get("kind", "")),
                 path=escape_md(target.get("path", "")),
                 status=escape_md(record["overall_status"]),
@@ -721,7 +882,19 @@ def build_review_comment(
         )
 
     for record in records:
-        lines.extend(["", f"### {record['task_id']}", ""])
+        lines.extend(["", f"### {record['task_id']} / `{escape_md(record['model'])}`", ""])
+        lines.append("**TODO**")
+        todo_items = record.get("todo_items", [])
+        if todo_items:
+            for item in todo_items:
+                lines.append(f"- {escape_md(str(item))}")
+        else:
+            lines.append("- No TODOs returned.")
+        lines.extend(["", "<details>", "<summary>Reasoning and evidence</summary>", ""])
+        if record.get("reasoning"):
+            lines.extend(["**Reasoning**", "", escape_md(str(record["reasoning"])), ""])
+        if record.get("summary"):
+            lines.extend(["**Summary**", "", escape_md(str(record["summary"])), ""])
         findings = record.get("findings", [])
         if findings:
             lines.append("**Findings**")
@@ -739,11 +912,19 @@ def build_review_comment(
         else:
             lines.append("**Findings**: None")
 
-        next_steps = record.get("recommended_next_steps", [])
-        if next_steps:
-            lines.extend(["", "**Recommended Next Steps**"])
-            for step in next_steps[:8]:
-                lines.append(f"- {escape_md(str(step))}")
+        merge_candidates = record.get("merge_candidates", [])
+        if merge_candidates:
+            lines.extend(["", "**Merge Candidates**"])
+            for candidate in merge_candidates[:8]:
+                lines.append(
+                    "- `{action}` from `{source}` to `{target}`: {reason}".format(
+                        action=escape_md(str(candidate.get("action", ""))),
+                        source=escape_md(str(candidate.get("source_path", ""))),
+                        target=escape_md(str(candidate.get("target_module", ""))),
+                        reason=escape_md(str(candidate.get("reason", ""))),
+                    )
+                )
+        lines.extend(["", "</details>"])
 
     if not targets:
         lines.append("")

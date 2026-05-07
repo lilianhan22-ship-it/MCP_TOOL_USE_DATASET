@@ -37,7 +37,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          LLM_MODEL: ${{ vars.LLM_MODEL || 'gpt-5.4' }}
+          LLM_REVIEW_MODELS: ${{ vars.LLM_REVIEW_MODELS || 'gpt-5.5,claude-opus-4.7' }}
           REPO_NAME: ${{ github.repository }}
           PR_NUMBER: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.number || inputs.pr_number }}
         run: python scripts/review_pr.py
