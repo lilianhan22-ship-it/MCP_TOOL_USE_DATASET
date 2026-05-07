@@ -717,6 +717,14 @@ def build_review_prompt(
            source-access issues when the task relies on paper-specific or
            source-specific values that are not reachable from released data,
            included source content, or a reasonable generic parsing path.
+        9. Treat an attached `input_data/reference_paper/target.pdf` as an
+           accessible source for this automated review. Do not tell the data
+           provider to add extracted target.pdf text, a PDF parser, a PDF table
+           tool, or a structured paper-parameter file solely because the values
+           come from target.pdf. Only flag this class of issue if target.pdf is
+           missing/omitted, the attached paper genuinely does not contain the
+           needed information, or the task requires values not present in either
+           released data or the target paper.
 
         Review dimensions:
 
@@ -784,6 +792,12 @@ def build_review_prompt(
         - Whether released data/tools provide enough evidence for the model to
           reproduce or justify the requested source-aligned conclusion.
 
+        If `input_data/reference_paper/target.pdf` is attached as multimodal
+        input, inspect that attachment directly for source-paper quantities,
+        figures, tables, and claims. Do not describe that target paper as "only
+        a binary PDF" or inaccessible merely because the task bundle's domain
+        tools do not implement PDF extraction.
+
         Flag as high severity for paper/source-answer contradictions, invented
         claims, wrong key numbers, wrong figure mapping, or a task that asks for
         a conclusion the source does not support. Use medium severity when the
@@ -812,6 +826,13 @@ def build_review_prompt(
         - Missing data-alignment logic, such as column aliases, metadata joins,
           file manifests, sample ID mapping, cohort mapping, country mapping, or
           chronology-to-parameter mapping.
+
+        Generic source inspection is not a required domain-tool feature here.
+        Do not flag missing PDF/image parsing helpers, read_text limitations on
+        binary PDFs, or missing structured paper-parameter files when the
+        original target paper itself is included and attached to this review.
+        Instead, evaluate whether the task, expected answer, data, tools, and
+        target paper are mutually consistent.
 
         For tools that are not general enough:
         - If the tool can be naturally split into reusable steps using the
@@ -984,7 +1005,10 @@ def call_review_model(
             "Inspect the attached target paper directly when checking source "
             "alignment, figures, plots, tables, or paper-supported claims. Do "
             "not claim that the target paper is inaccessible unless the manifest "
-            "says it was omitted or the model cannot parse it."
+            "says it was omitted or the model cannot parse it. Do not recommend "
+            "adding PDF extraction tools or structured paper-parameter files "
+            "solely to expose information that is already present in this "
+            "attached target paper."
         )
 
     try:
