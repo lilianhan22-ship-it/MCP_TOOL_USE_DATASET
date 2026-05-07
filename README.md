@@ -19,13 +19,13 @@ git checkout -b chem_example_0001
 1. 提交 raw task 压缩包，例如：
 
 ```text
-datasets/raw/chem_example_0001.zip
+datasets/raw/chem/chem_example_0001.zip
 ```
 
 2. 提交已解压的 raw task 目录，例如：
 
 ```text
-datasets/raw/chem_example_0001/
+datasets/raw/chem/chem_example_0001/
 ├── task_content/
 │   └── task_content.json
 ├── tools/
@@ -69,10 +69,26 @@ PR 创建或更新后，GitHub Actions 会自动运行 MCP task 数据审查流�
 
 ## 目录结构
 
-建议每条 raw task 使用如下结构：
+本仓库按领域组织 raw task，目前包含 10 个领域目录：
 
 ```text
-datasets/raw/<task_id>/
+datasets/raw/
+├── astro/
+├── chem/
+├── energy/
+├── geo/
+├── info/
+├── life/
+├── mat/
+├── math/
+├── neuro/
+└── phys/
+```
+
+建议每条 raw task 放在对应领域目录下，使用如下结构：
+
+```text
+datasets/raw/<domain>/<task_id>/
 ├── task_content/
 │   └── task_content.json          # 任务 instruction、input_data、answer/checklist 等
 ├── tools/                         # MCP/domain-specific tools
