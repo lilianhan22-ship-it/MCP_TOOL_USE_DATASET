@@ -28,6 +28,11 @@ MAX_FILES_PER_TASK = 220
 MAX_TEXT_BYTES = 80_000
 MAX_PDF_TEXT_CHARS = 40_000
 MAX_TOTAL_PROMPT_CHARS = 240_000
+MAX_MEDIA_FILES = int(os.getenv("MAX_REVIEW_MEDIA_FILES", "80"))
+MAX_MEDIA_BYTES = int(os.getenv("MAX_REVIEW_MEDIA_BYTES", str(25 * 1024 * 1024)))
+MAX_TOTAL_MEDIA_BYTES = int(
+    os.getenv("MAX_REVIEW_TOTAL_MEDIA_BYTES", str(100 * 1024 * 1024))
+)
 REVIEW_COMMENT_MARKER = "<!-- MCP_TOOL_USE_DATA_REVIEW -->"
 
 TEXT_EXTENSIONS = {
@@ -45,6 +50,18 @@ TEXT_EXTENSIONS = {
     ".yml",
 }
 TEXT_FILENAMES = {"readme", "license", "manifest"}
+
+MEDIA_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
 
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -168,6 +185,17 @@ class FileSnapshot:
     changed: bool
     content: str | None
     note: str
+    mime_type: str | None = None
+    media_base64: str | None = None
+
+
+@dataclass(frozen=True)
+class MediaAttachment:
+    path: str
+    size: int
+    changed: bool
+    mime_type: str
+    media_base64: str
 
 
 def main() -> int:
@@ -206,9 +234,19 @@ def main() -> int:
             snapshot = collect_target_snapshot(target, changed_files, head_repo, head_ref)
             base_snapshot = collect_base_snapshot(target, repo, base_ref)
             prompt = build_review_prompt(target, snapshot, base_snapshot, changed_files)
+            media_attachments, media_omissions = collect_media_attachments(
+                snapshot,
+                base_snapshot,
+            )
             for model in llm_models:
                 try:
-                    record = call_review_model(client, model, prompt)
+                    record = call_review_model(
+                        client,
+                        model,
+                        prompt,
+                        media_attachments,
+                        media_omissions,
+                    )
                 except Exception as exc:
                     record = failed_review_record(target, model, exc)
                 records.append(normalize_record(target, model, record))
@@ -386,7 +424,7 @@ def snapshot_zip(
                     )
                 )
                 continue
-            content, note = read_zip_member_text(zf, info)
+            content, note, mime_type, media_base64 = read_zip_member_text(zf, info)
             snapshots.append(
                 FileSnapshot(
                     path=f"{zip_path}!/{normalized}",
@@ -394,6 +432,8 @@ def snapshot_zip(
                     changed=(zip_path in changed_paths),
                     content=content,
                     note=note,
+                    mime_type=mime_type,
+                    media_base64=media_base64,
                 )
             )
         if len(members) > MAX_FILES_PER_TASK:
@@ -419,13 +459,30 @@ def normalize_zip_member(name: str) -> str | None:
 def read_zip_member_text(
     zf: zipfile.ZipFile,
     info: zipfile.ZipInfo,
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, str | None, str | None]:
     suffix = PurePosixPath(info.filename).suffix.lower()
     if suffix == ".pdf":
         raw_pdf = zf.read(info)
-        return extract_pdf_text(raw_pdf)
+        content, note = extract_pdf_text(raw_pdf)
+        mime_type, media_base64, media_note = encode_media_attachment(
+            info.filename,
+            raw_pdf,
+        )
+        return content, append_note(note, media_note), mime_type, media_base64
+    if is_media_path(info.filename):
+        raw_media = zf.read(info)
+        mime_type, media_base64, media_note = encode_media_attachment(
+            info.filename,
+            raw_media,
+        )
+        return (
+            None,
+            append_note("binary media; content omitted from text prompt", media_note),
+            mime_type,
+            media_base64,
+        )
     if not is_text_like_path(info.filename):
-        return None, "binary or non-text file; content omitted"
+        return None, "binary or non-text file; content omitted", None, None
     with zf.open(info) as handle:
         raw = handle.read(MAX_TEXT_BYTES + 1)
     truncated = len(raw) > MAX_TEXT_BYTES
@@ -434,7 +491,7 @@ def read_zip_member_text(
     text = raw.decode("utf-8", errors="replace")
     if truncated:
         text += "\n\n...[truncated]..."
-    return text, "text"
+    return text, "text", None, None
 
 
 def snapshot_directory(
@@ -446,7 +503,7 @@ def snapshot_directory(
     paths = fetch_directory_paths(repo, root, ref)
     snapshots: list[FileSnapshot] = []
     for path in paths[:MAX_FILES_PER_TASK]:
-        content, size, note = fetch_text_snapshot(repo, path, ref)
+        content, size, note, mime_type, media_base64 = fetch_text_snapshot(repo, path, ref)
         snapshots.append(
             FileSnapshot(
                 path=path,
@@ -454,6 +511,8 @@ def snapshot_directory(
                 changed=(path in changed_paths),
                 content=content,
                 note=note,
+                mime_type=mime_type,
+                media_base64=media_base64,
             )
         )
     if len(paths) > MAX_FILES_PER_TASK:
@@ -489,30 +548,83 @@ def fetch_directory_paths(repo: Any, root: str, ref: str) -> list[str]:
     return paths
 
 
-def fetch_text_snapshot(repo: Any, path: str, ref: str) -> tuple[str | None, int, str]:
+def fetch_text_snapshot(
+    repo: Any,
+    path: str,
+    ref: str,
+) -> tuple[str | None, int, str, str | None, str | None]:
     suffix = PurePosixPath(path).suffix.lower()
     try:
         raw = fetch_file_bytes(repo, path, ref)
     except Exception as exc:
-        return None, 0, f"could not fetch file: {type(exc).__name__}: {exc}"
+        return None, 0, f"could not fetch file: {type(exc).__name__}: {exc}", None, None
 
     size = len(raw)
     if suffix == ".pdf":
         content, note = extract_pdf_text(raw)
-        return content, size, note
+        mime_type, media_base64, media_note = encode_media_attachment(path, raw)
+        return content, size, append_note(note, media_note), mime_type, media_base64
+    if is_media_path(path):
+        mime_type, media_base64, media_note = encode_media_attachment(path, raw)
+        return (
+            None,
+            size,
+            append_note("binary media; content omitted from text prompt", media_note),
+            mime_type,
+            media_base64,
+        )
     if not is_text_like_path(path):
-        return None, size, "binary or non-text file; content omitted"
+        return None, size, "binary or non-text file; content omitted", None, None
     raw = raw[:MAX_TEXT_BYTES]
     text = raw.decode("utf-8", errors="replace")
     if size > MAX_TEXT_BYTES:
         text += "\n\n...[truncated]..."
-    return text, size, "text"
+    return text, size, "text", None, None
 
 
 def is_text_like_path(path: str) -> bool:
     pure = PurePosixPath(path)
     suffix = pure.suffix.lower()
     return suffix in TEXT_EXTENSIONS or pure.name.lower() in TEXT_FILENAMES
+
+
+def is_media_path(path: str) -> bool:
+    return media_mime_type(path) is not None
+
+
+def media_mime_type(path: str) -> str | None:
+    return MEDIA_MIME_TYPES.get(PurePosixPath(path).suffix.lower())
+
+
+def encode_media_attachment(path: str, raw: bytes) -> tuple[str | None, str | None, str]:
+    mime_type = media_mime_type(path)
+    if mime_type is None:
+        return None, None, ""
+    if len(raw) > MAX_MEDIA_BYTES:
+        return (
+            mime_type,
+            None,
+            f"{mime_type} not attached because file exceeds {format_bytes(MAX_MEDIA_BYTES)}",
+        )
+    return (
+        mime_type,
+        base64.b64encode(raw).decode("utf-8"),
+        f"{mime_type} available as multimodal input",
+    )
+
+
+def append_note(note: str, extra: str) -> str:
+    if not extra:
+        return note
+    return f"{note}; {extra}"
+
+
+def format_bytes(value: int) -> str:
+    if value >= 1024 * 1024:
+        return f"{value / (1024 * 1024):.1f} MiB"
+    if value >= 1024:
+        return f"{value / 1024:.1f} KiB"
+    return f"{value} bytes"
 
 
 def extract_pdf_text(raw_pdf: bytes) -> tuple[str | None, str]:
@@ -567,8 +679,10 @@ def build_review_prompt(
         Target kind: {target.kind}
         Target path: {target.path}
 
-        Work only from the file contents included below. Do not use the web.
-        Do not ask for more information. Do not suggest running project code.
+        Work only from the file contents included below and any multimodal
+        PDF/image attachments sent in the same model request. Do not use the
+        web. Do not ask for more information. Do not suggest running project
+        code.
 
         Changed files in this PR:
         {changed_context}
@@ -822,7 +936,158 @@ def snapshot_prompt_priority(item: FileSnapshot) -> tuple[int, str]:
     return (rank, path)
 
 
-def call_review_model(client: OpenAI, model: str, prompt: str) -> dict[str, Any]:
+def collect_media_attachments(
+    snapshot: list[FileSnapshot],
+    base_snapshot: list[FileSnapshot],
+) -> tuple[list[MediaAttachment], list[str]]:
+    attachments: list[MediaAttachment] = []
+    omissions: list[str] = []
+    total_bytes = 0
+
+    for item in sorted(snapshot + base_snapshot, key=snapshot_prompt_priority):
+        if item.mime_type is None:
+            continue
+        label = "CHANGED" if item.changed else "CONTEXT"
+        descriptor = (
+            f"{label} {item.path} ({format_bytes(item.size)}; {item.mime_type})"
+        )
+        if item.media_base64 is None:
+            omissions.append(f"- omitted: {descriptor}; {item.note}")
+            continue
+        if len(attachments) >= MAX_MEDIA_FILES:
+            omissions.append(
+                f"- omitted: {descriptor}; exceeds MAX_REVIEW_MEDIA_FILES={MAX_MEDIA_FILES}"
+            )
+            continue
+        if total_bytes + item.size > MAX_TOTAL_MEDIA_BYTES:
+            omissions.append(
+                "- omitted: "
+                f"{descriptor}; exceeds MAX_REVIEW_TOTAL_MEDIA_BYTES="
+                f"{format_bytes(MAX_TOTAL_MEDIA_BYTES)}"
+            )
+            continue
+        attachments.append(
+            MediaAttachment(
+                path=item.path,
+                size=item.size,
+                changed=item.changed,
+                mime_type=item.mime_type,
+                media_base64=item.media_base64,
+            )
+        )
+        total_bytes += item.size
+
+    return attachments, omissions
+
+
+def render_media_manifest(
+    attachments: list[MediaAttachment],
+    omissions: list[str],
+) -> str:
+    lines: list[str] = []
+    if attachments:
+        lines.append("PDF/image files attached as multimodal `input_image` items:")
+        for item in attachments:
+            label = "CHANGED" if item.changed else "CONTEXT"
+            lines.append(
+                f"- attached: {label} {item.path} "
+                f"({format_bytes(item.size)}; {item.mime_type})"
+            )
+    if omissions:
+        if lines:
+            lines.append("")
+        lines.append("PDF/image files not attached as multimodal input:")
+        lines.extend(omissions)
+    return "\n".join(lines)
+
+
+def call_review_model(
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    media_attachments: list[MediaAttachment],
+    media_omissions: list[str],
+) -> dict[str, Any]:
+    prompt_with_media = prompt
+    media_manifest = render_media_manifest(media_attachments, media_omissions)
+    if media_manifest:
+        prompt_with_media += (
+            "\n\nMultimodal attachment manifest:\n"
+            f"{media_manifest}\n\n"
+            "Inspect the attached PDFs/images directly when checking source "
+            "alignment, figures, screenshots, plots, scanned content, or visual "
+            "artifacts. Do not claim that an attached PDF/image is inaccessible "
+            "unless the manifest says it was omitted or the model cannot parse it."
+        )
+
+    try:
+        response = call_responses_model(
+            client,
+            model,
+            prompt_with_media,
+            media_attachments,
+            json_mode=True,
+        )
+    except Exception:
+        try:
+            response = call_responses_model(
+                client,
+                model,
+                prompt_with_media,
+                media_attachments,
+                json_mode=False,
+            )
+        except Exception:
+            if media_attachments:
+                raise
+            response = call_chat_model(client, model, prompt_with_media)
+
+    return parse_json_response(extract_response_text(response))
+
+
+def call_responses_model(
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    media_attachments: list[MediaAttachment],
+    json_mode: bool,
+) -> Any:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": "You are a strict benchmark data reviewer. Return JSON only.\n\n"
+            + prompt,
+        }
+    ]
+    for item in media_attachments:
+        content.append(
+            {
+                "type": "input_text",
+                "text": (
+                    f"Attached file: {item.path} "
+                    f"({format_bytes(item.size)}; {item.mime_type})"
+                ),
+            }
+        )
+        content.append(
+            {
+                "type": "input_image",
+                "image_base64": item.media_base64,
+                "mime_type": item.mime_type,
+            }
+        )
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "input": [{"role": "user", "content": content}],
+        "temperature": 0.3,
+    }
+    if json_mode:
+        kwargs["text"] = {"format": {"type": "json_object"}}
+    return client.responses.create(**kwargs)
+
+
+def call_chat_model(client: OpenAI, model: str, prompt: str) -> Any:
     messages = [
         {
             "role": "system",
@@ -843,8 +1108,57 @@ def call_review_model(client: OpenAI, model: str, prompt: str) -> dict[str, Any]
             messages=messages,
             temperature=0.3,
         )
-    text = response.choices[0].message.content or "{}"
-    return parse_json_response(text)
+    return response
+
+
+def extract_response_text(response: Any) -> str:
+    if isinstance(response, dict):
+        output_text = response.get("output_text")
+        if output_text:
+            return str(output_text)
+        choices = response.get("choices")
+        if choices:
+            return choices[0].get("message", {}).get("content") or "{}"
+        output = response.get("output")
+        if output:
+            chunks: list[str] = []
+            for item in output:
+                for content in item.get("content", []) if isinstance(item, dict) else []:
+                    if isinstance(content, dict) and content.get("text"):
+                        chunks.append(str(content["text"]))
+            if chunks:
+                return "\n".join(chunks)
+        return json.dumps(response, ensure_ascii=False)
+
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return str(output_text)
+    choices = getattr(response, "choices", None)
+    if choices:
+        return choices[0].message.content or "{}"
+
+    output = getattr(response, "output", None)
+    if output:
+        chunks: list[str] = []
+        for item in output:
+            if isinstance(item, dict):
+                contents = item.get("content", [])
+            else:
+                contents = getattr(item, "content", []) or []
+            for content in contents:
+                if isinstance(content, dict):
+                    text = content.get("text")
+                else:
+                    text = getattr(content, "text", None)
+                if text:
+                    chunks.append(str(text))
+        if chunks:
+            return "\n".join(chunks)
+
+    if hasattr(response, "model_dump"):
+        dumped = response.model_dump()
+        return json.dumps(dumped, ensure_ascii=False)
+    return str(response)
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
