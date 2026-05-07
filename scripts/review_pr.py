@@ -28,11 +28,7 @@ MAX_FILES_PER_TASK = 220
 MAX_TEXT_BYTES = 80_000
 MAX_PDF_TEXT_CHARS = 40_000
 MAX_TOTAL_PROMPT_CHARS = 240_000
-MAX_MEDIA_FILES = int(os.getenv("MAX_REVIEW_MEDIA_FILES", "80"))
 MAX_MEDIA_BYTES = int(os.getenv("MAX_REVIEW_MEDIA_BYTES", str(25 * 1024 * 1024)))
-MAX_TOTAL_MEDIA_BYTES = int(
-    os.getenv("MAX_REVIEW_TOTAL_MEDIA_BYTES", str(100 * 1024 * 1024))
-)
 REVIEW_COMMENT_MARKER = "<!-- MCP_TOOL_USE_DATA_REVIEW -->"
 
 TEXT_EXTENSIONS = {
@@ -51,16 +47,8 @@ TEXT_EXTENSIONS = {
 }
 TEXT_FILENAMES = {"readme", "license", "manifest"}
 
-MEDIA_MIME_TYPES = {
+ATTACHMENT_MIME_TYPES = {
     ".pdf": "application/pdf",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-    ".bmp": "image/bmp",
-    ".tif": "image/tiff",
-    ".tiff": "image/tiff",
 }
 
 REVIEW_SCHEMA: dict[str, Any] = {
@@ -234,10 +222,7 @@ def main() -> int:
             snapshot = collect_target_snapshot(target, changed_files, head_repo, head_ref)
             base_snapshot = collect_base_snapshot(target, repo, base_ref)
             prompt = build_review_prompt(target, snapshot, base_snapshot, changed_files)
-            media_attachments, media_omissions = collect_media_attachments(
-                snapshot,
-                base_snapshot,
-            )
+            media_attachments, media_omissions = collect_media_attachments(snapshot)
             for model in llm_models:
                 try:
                     record = call_review_model(
@@ -464,23 +449,11 @@ def read_zip_member_text(
     if suffix == ".pdf":
         raw_pdf = zf.read(info)
         content, note = extract_pdf_text(raw_pdf)
-        mime_type, media_base64, media_note = encode_media_attachment(
+        mime_type, media_base64, media_note = encode_target_paper_attachment(
             info.filename,
             raw_pdf,
         )
         return content, append_note(note, media_note), mime_type, media_base64
-    if is_media_path(info.filename):
-        raw_media = zf.read(info)
-        mime_type, media_base64, media_note = encode_media_attachment(
-            info.filename,
-            raw_media,
-        )
-        return (
-            None,
-            append_note("binary media; content omitted from text prompt", media_note),
-            mime_type,
-            media_base64,
-        )
     if not is_text_like_path(info.filename):
         return None, "binary or non-text file; content omitted", None, None
     with zf.open(info) as handle:
@@ -562,17 +535,8 @@ def fetch_text_snapshot(
     size = len(raw)
     if suffix == ".pdf":
         content, note = extract_pdf_text(raw)
-        mime_type, media_base64, media_note = encode_media_attachment(path, raw)
+        mime_type, media_base64, media_note = encode_target_paper_attachment(path, raw)
         return content, size, append_note(note, media_note), mime_type, media_base64
-    if is_media_path(path):
-        mime_type, media_base64, media_note = encode_media_attachment(path, raw)
-        return (
-            None,
-            size,
-            append_note("binary media; content omitted from text prompt", media_note),
-            mime_type,
-            media_base64,
-        )
     if not is_text_like_path(path):
         return None, size, "binary or non-text file; content omitted", None, None
     raw = raw[:MAX_TEXT_BYTES]
@@ -588,15 +552,28 @@ def is_text_like_path(path: str) -> bool:
     return suffix in TEXT_EXTENSIONS or pure.name.lower() in TEXT_FILENAMES
 
 
-def is_media_path(path: str) -> bool:
-    return media_mime_type(path) is not None
-
-
 def media_mime_type(path: str) -> str | None:
-    return MEDIA_MIME_TYPES.get(PurePosixPath(path).suffix.lower())
+    return ATTACHMENT_MIME_TYPES.get(PurePosixPath(path).suffix.lower())
 
 
-def encode_media_attachment(path: str, raw: bytes) -> tuple[str | None, str | None, str]:
+def is_target_paper_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").lower()
+    if "!/" in normalized:
+        normalized = normalized.split("!/", 1)[1]
+    target_suffix = "input_data/reference_paper/target.pdf"
+    return normalized == target_suffix or normalized.endswith(f"/{target_suffix}")
+
+
+def encode_target_paper_attachment(
+    path: str,
+    raw: bytes,
+) -> tuple[str | None, str | None, str]:
+    if not is_target_paper_path(path):
+        return (
+            None,
+            None,
+            "not attached as multimodal input; only input_data/reference_paper/target.pdf is attached",
+        )
     mime_type = media_mime_type(path)
     if mime_type is None:
         return None, None, ""
@@ -679,10 +656,10 @@ def build_review_prompt(
         Target kind: {target.kind}
         Target path: {target.path}
 
-        Work only from the file contents included below and any multimodal
-        PDF/image attachments sent in the same model request. Do not use the
-        web. Do not ask for more information. Do not suggest running project
-        code.
+        Work only from the file contents included below and the target-paper
+        multimodal attachment, if present in the same model request. Do not use
+        the web. Do not ask for more information. Do not suggest running
+        project code.
 
         Changed files in this PR:
         {changed_context}
@@ -938,13 +915,11 @@ def snapshot_prompt_priority(item: FileSnapshot) -> tuple[int, str]:
 
 def collect_media_attachments(
     snapshot: list[FileSnapshot],
-    base_snapshot: list[FileSnapshot],
 ) -> tuple[list[MediaAttachment], list[str]]:
     attachments: list[MediaAttachment] = []
     omissions: list[str] = []
-    total_bytes = 0
 
-    for item in sorted(snapshot + base_snapshot, key=snapshot_prompt_priority):
+    for item in sorted(snapshot, key=snapshot_prompt_priority):
         if item.mime_type is None:
             continue
         label = "CHANGED" if item.changed else "CONTEXT"
@@ -954,16 +929,9 @@ def collect_media_attachments(
         if item.media_base64 is None:
             omissions.append(f"- omitted: {descriptor}; {item.note}")
             continue
-        if len(attachments) >= MAX_MEDIA_FILES:
+        if attachments:
             omissions.append(
-                f"- omitted: {descriptor}; exceeds MAX_REVIEW_MEDIA_FILES={MAX_MEDIA_FILES}"
-            )
-            continue
-        if total_bytes + item.size > MAX_TOTAL_MEDIA_BYTES:
-            omissions.append(
-                "- omitted: "
-                f"{descriptor}; exceeds MAX_REVIEW_TOTAL_MEDIA_BYTES="
-                f"{format_bytes(MAX_TOTAL_MEDIA_BYTES)}"
+                f"- omitted: {descriptor}; only one target paper attachment is sent"
             )
             continue
         attachments.append(
@@ -975,7 +943,6 @@ def collect_media_attachments(
                 media_base64=item.media_base64,
             )
         )
-        total_bytes += item.size
 
     return attachments, omissions
 
@@ -986,7 +953,7 @@ def render_media_manifest(
 ) -> str:
     lines: list[str] = []
     if attachments:
-        lines.append("PDF/image files attached as multimodal `input_image` items:")
+        lines.append("Target paper attached as a multimodal `input_image` item:")
         for item in attachments:
             label = "CHANGED" if item.changed else "CONTEXT"
             lines.append(
@@ -996,7 +963,7 @@ def render_media_manifest(
     if omissions:
         if lines:
             lines.append("")
-        lines.append("PDF/image files not attached as multimodal input:")
+        lines.append("Target paper files not attached as multimodal input:")
         lines.extend(omissions)
     return "\n".join(lines)
 
@@ -1014,10 +981,10 @@ def call_review_model(
         prompt_with_media += (
             "\n\nMultimodal attachment manifest:\n"
             f"{media_manifest}\n\n"
-            "Inspect the attached PDFs/images directly when checking source "
-            "alignment, figures, screenshots, plots, scanned content, or visual "
-            "artifacts. Do not claim that an attached PDF/image is inaccessible "
-            "unless the manifest says it was omitted or the model cannot parse it."
+            "Inspect the attached target paper directly when checking source "
+            "alignment, figures, plots, tables, or paper-supported claims. Do "
+            "not claim that the target paper is inaccessible unless the manifest "
+            "says it was omitted or the model cannot parse it."
         )
 
     try:
