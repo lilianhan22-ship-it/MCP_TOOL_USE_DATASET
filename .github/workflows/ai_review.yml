@@ -30,7 +30,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: python -m pip install --upgrade PyGithub openai
+        run: python -m pip install --upgrade PyGithub openai pymupdf
 
       - name: Run MCP task review
         env:

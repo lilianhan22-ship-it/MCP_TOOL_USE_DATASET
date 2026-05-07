@@ -26,21 +26,25 @@ from openai import OpenAI
 
 MAX_FILES_PER_TASK = 220
 MAX_TEXT_BYTES = 80_000
+MAX_PDF_TEXT_CHARS = 40_000
 MAX_TOTAL_PROMPT_CHARS = 240_000
 REVIEW_COMMENT_MARKER = "<!-- MCP_TOOL_USE_DATA_REVIEW -->"
 
 TEXT_EXTENSIONS = {
     ".csv",
+    ".dat",
     ".json",
     ".jsonl",
     ".md",
     ".py",
     ".r",
+    ".tab",
     ".txt",
     ".tsv",
     ".yaml",
     ".yml",
 }
+TEXT_FILENAMES = {"readme", "license", "manifest"}
 
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -417,7 +421,10 @@ def read_zip_member_text(
     info: zipfile.ZipInfo,
 ) -> tuple[str | None, str]:
     suffix = PurePosixPath(info.filename).suffix.lower()
-    if suffix not in TEXT_EXTENSIONS:
+    if suffix == ".pdf":
+        raw_pdf = zf.read(info)
+        return extract_pdf_text(raw_pdf)
+    if not is_text_like_path(info.filename):
         return None, "binary or non-text file; content omitted"
     with zf.open(info) as handle:
         raw = handle.read(MAX_TEXT_BYTES + 1)
@@ -490,13 +497,55 @@ def fetch_text_snapshot(repo: Any, path: str, ref: str) -> tuple[str | None, int
         return None, 0, f"could not fetch file: {type(exc).__name__}: {exc}"
 
     size = len(raw)
-    if suffix not in TEXT_EXTENSIONS:
+    if suffix == ".pdf":
+        content, note = extract_pdf_text(raw)
+        return content, size, note
+    if not is_text_like_path(path):
         return None, size, "binary or non-text file; content omitted"
     raw = raw[:MAX_TEXT_BYTES]
     text = raw.decode("utf-8", errors="replace")
     if size > MAX_TEXT_BYTES:
         text += "\n\n...[truncated]..."
     return text, size, "text"
+
+
+def is_text_like_path(path: str) -> bool:
+    pure = PurePosixPath(path)
+    suffix = pure.suffix.lower()
+    return suffix in TEXT_EXTENSIONS or pure.name.lower() in TEXT_FILENAMES
+
+
+def extract_pdf_text(raw_pdf: bytes) -> tuple[str | None, str]:
+    try:
+        import fitz
+    except Exception:
+        return None, "PDF text omitted; PyMuPDF is not installed"
+
+    try:
+        doc = fitz.open(stream=raw_pdf, filetype="pdf")
+        chunks = []
+        total = 0
+        for page in doc:
+            text = page.get_text("text")
+            if not text:
+                continue
+            remaining = MAX_PDF_TEXT_CHARS - total
+            if remaining <= 0:
+                break
+            chunks.append(text[:remaining])
+            total += min(len(text), remaining)
+        doc.close()
+    except Exception as exc:
+        return None, f"PDF text extraction failed: {type(exc).__name__}: {exc}"
+
+    text = "\n".join(chunks).strip()
+    if not text:
+        return None, "PDF text extraction produced no text"
+    note = "pdf_text"
+    if len(text) >= MAX_PDF_TEXT_CHARS:
+        text += "\n\n...[pdf text truncated]..."
+        note = "pdf_text_truncated"
+    return text, note
 
 
 def build_review_prompt(
@@ -735,7 +784,7 @@ def build_review_prompt(
 
 def render_file_context(snapshot: list[FileSnapshot]) -> str:
     blocks = []
-    for item in snapshot:
+    for item in sorted(snapshot, key=snapshot_prompt_priority):
         status = "CHANGED" if item.changed else "CONTEXT"
         header = f"### [{status}] {item.path} ({item.size} bytes; {item.note})"
         if item.content is None:
@@ -743,6 +792,28 @@ def render_file_context(snapshot: list[FileSnapshot]) -> str:
         else:
             blocks.append(f"{header}\n```text\n{item.content}\n```")
     return "\n\n".join(blocks) if blocks else "(No files were collected.)"
+
+
+def snapshot_prompt_priority(item: FileSnapshot) -> tuple[int, str]:
+    path = item.path
+    lower = path.lower()
+    if "/task_content/" in lower:
+        rank = 0
+    elif "/tools/" in lower:
+        rank = 1
+    elif lower.endswith("/readme") or lower.endswith("readme.md"):
+        rank = 2
+    elif "/input_data/reference_paper/target.pdf" in lower:
+        rank = 3
+    elif "/input_data/reference_paper/" in lower and lower.endswith(".pdf"):
+        rank = 4
+    elif "/input_data/" in lower and item.content is not None:
+        rank = 5
+    elif "/artifacts/" in lower:
+        rank = 6
+    else:
+        rank = 7
+    return (rank, path)
 
 
 def call_review_model(client: OpenAI, model: str, prompt: str) -> dict[str, Any]:
