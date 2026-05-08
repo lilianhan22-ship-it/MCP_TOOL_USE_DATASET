@@ -22,7 +22,7 @@ jobs:
       - name: Checkout trusted review code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.sha }}
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5

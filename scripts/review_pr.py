@@ -30,6 +30,7 @@ MAX_PDF_TEXT_CHARS = 40_000
 MAX_TOTAL_PROMPT_CHARS = 240_000
 MAX_MEDIA_BYTES = int(os.getenv("MAX_REVIEW_MEDIA_BYTES", str(25 * 1024 * 1024)))
 REVIEW_COMMENT_MARKER = "<!-- MCP_TOOL_USE_DATA_REVIEW -->"
+REVIEW_SCRIPT_VERSION = "pdf-smoke-v2"
 
 TEXT_EXTENSIONS = {
     ".csv",
@@ -1204,7 +1205,8 @@ def add_temperature_if_supported(kwargs: dict[str, Any], model: str) -> None:
 
 
 def model_supports_temperature(model: str) -> bool:
-    return not model.lower().startswith("claude")
+    lowered = model.lower()
+    return "claude" not in lowered and "anthropic" not in lowered
 
 
 def run_pdf_smoke_tests(
@@ -1433,6 +1435,8 @@ def build_review_comment(
         REVIEW_COMMENT_MARKER,
         f"## MCP Tool Use Data Review for PR #{pr_number}",
         "",
+        f"Reviewer script version: `{REVIEW_SCRIPT_VERSION}`",
+        "",
         "| Task | Model | Target | Status | Fit | High | Medium | Low | Summary |",
         "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
     ]
@@ -1453,6 +1457,8 @@ def build_review_comment(
                 summary=escape_md(record["summary"].replace("\n", " ")),
             )
         )
+
+    append_pdf_smoke_test_section(lines, smoke_results)
 
     for record in records:
         lines.extend(["", f"### {record['task_id']} / `{escape_md(record['model'])}`", ""])
@@ -1499,42 +1505,48 @@ def build_review_comment(
                 )
         lines.extend(["", "</details>"])
 
-    if smoke_results:
-        lines.extend(
-            [
-                "",
-                "## Temporary PDF Attachment Smoke Tests",
-                "",
-                "These two extra model calls are temporary and are not part of the data review score.",
-            ]
-        )
-        for result in smoke_results:
-            lines.extend(
-                [
-                    "",
-                    f"### PDF smoke test: {escape_md(result.task_id)} / `{escape_md(result.model)}`",
-                    "",
-                    f"- Status: `{escape_md(result.status)}`",
-                    f"- Attachment mode: `{escape_md(result.attachment_mode)}`",
-                    f"- Target: `{escape_md(result.target_path)}`",
-                    f"- Attachment: `{escape_md(result.attachment_path or '(none)')}`",
-                    "",
-                    "<details>",
-                    "<summary>Translated abstract smoke-test output</summary>",
-                    "",
-                    "```text",
-                    trim_comment_text(result.output, 6_000),
-                    "```",
-                    "",
-                    "</details>",
-                ]
-            )
-
     if not targets:
         lines.append("")
         lines.append("No task targets were detected.")
 
     return "\n".join(lines)
+
+
+def append_pdf_smoke_test_section(
+    lines: list[str],
+    smoke_results: list[PdfSmokeTestResult],
+) -> None:
+    if not smoke_results:
+        return
+    lines.extend(
+        [
+            "",
+            "## Temporary PDF Attachment Smoke Tests",
+            "",
+            "These two extra model calls are temporary and are not part of the data review score.",
+        ]
+    )
+    for result in smoke_results:
+        lines.extend(
+            [
+                "",
+                f"### PDF smoke test: {escape_md(result.task_id)} / `{escape_md(result.model)}`",
+                "",
+                f"- Status: `{escape_md(result.status)}`",
+                f"- Attachment mode: `{escape_md(result.attachment_mode)}`",
+                f"- Target: `{escape_md(result.target_path)}`",
+                f"- Attachment: `{escape_md(result.attachment_path or '(none)')}`",
+                "",
+                "<details>",
+                "<summary>Translated abstract smoke-test output</summary>",
+                "",
+                "```text",
+                trim_comment_text(result.output, 6_000),
+                "```",
+                "",
+                "</details>",
+            ]
+        )
 
 
 def build_no_target_comment(pr_number: int, changed_files: list[ChangedFile]) -> str:
