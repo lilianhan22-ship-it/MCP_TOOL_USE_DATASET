@@ -54,7 +54,7 @@ PR 创建或更新后，GitHub Actions 会自动运行 MCP task 数据审查流�
 自动审查会读取本次 PR 中新增或修改的 raw task zip / raw task 目录，并分别调用两个审查模型进行质量检查：
 
 - `gpt-5.5`
-- `claude-opus-4.7`
+- `claude-opus-4-7`
 
 审查输入会包含任务目录中的文本文件内容；`input_data/reference_paper/target.pdf` 会作为多模态附件发送给模型，以便检查论文、图表和任务内容是否对应。图片和其他 PDF 不会作为多模态附件发送。
 

@@ -252,8 +252,13 @@ def require_env(name: str) -> str:
 
 
 def parse_review_models(raw: str | None) -> list[str]:
-    models = [item.strip() for item in (raw or "").split(",") if item.strip()]
-    return models or ["gpt-5.5", "claude-opus-4.7"]
+    aliases = {"claude-opus-4.7": "claude-opus-4-7"}
+    models = []
+    for item in (raw or "").split(","):
+        model = item.strip()
+        if model:
+            models.append(aliases.get(model, model))
+    return models or ["gpt-5.5", "claude-opus-4-7"]
 
 
 def detect_task_targets(
@@ -974,7 +979,7 @@ def render_media_manifest(
 ) -> str:
     lines: list[str] = []
     if attachments:
-        lines.append("Target paper attached as a multimodal `input_image` item:")
+        lines.append("Target paper attached as a multimodal file item:")
         for item in attachments:
             label = "CHANGED" if item.changed else "CONTEXT"
             lines.append(
@@ -996,44 +1001,96 @@ def call_review_model(
     media_attachments: list[MediaAttachment],
     media_omissions: list[str],
 ) -> dict[str, Any]:
-    prompt_with_media = prompt
-    media_manifest = render_media_manifest(media_attachments, media_omissions)
-    if media_manifest:
-        prompt_with_media += (
-            "\n\nMultimodal attachment manifest:\n"
-            f"{media_manifest}\n\n"
-            "Inspect the attached target paper directly when checking source "
-            "alignment, figures, plots, tables, or paper-supported claims. Do "
-            "not claim that the target paper is inaccessible unless the manifest "
-            "says it was omitted or the model cannot parse it. Do not recommend "
-            "adding PDF extraction tools or structured paper-parameter files "
-            "solely to expose information that is already present in this "
-            "attached target paper."
-        )
+    prompt_with_media = append_media_manifest(
+        prompt,
+        media_attachments,
+        media_omissions,
+    )
+    prompt_without_media = append_text_only_fallback_note(
+        prompt,
+        media_attachments,
+        media_omissions,
+    )
 
-    try:
-        response = call_responses_model(
-            client,
-            model,
-            prompt_with_media,
-            media_attachments,
-            json_mode=True,
+    response: Any | None = None
+    for attachment_mode, json_mode in review_call_attempts(media_attachments):
+        attempt_prompt = (
+            prompt_without_media if attachment_mode == "none" else prompt_with_media
         )
-    except Exception:
         try:
             response = call_responses_model(
                 client,
                 model,
-                prompt_with_media,
-                media_attachments,
-                json_mode=False,
+                attempt_prompt,
+                media_attachments if attachment_mode != "none" else [],
+                json_mode=json_mode,
+                attachment_mode=attachment_mode,
             )
+            break
         except Exception:
-            if media_attachments:
-                raise
-            response = call_chat_model(client, model, prompt_with_media)
+            response = None
+
+    if response is None:
+        response = call_chat_model(client, model, prompt_without_media)
 
     return parse_json_response(extract_response_text(response))
+
+
+def append_media_manifest(
+    prompt: str,
+    media_attachments: list[MediaAttachment],
+    media_omissions: list[str],
+) -> str:
+    media_manifest = render_media_manifest(media_attachments, media_omissions)
+    if not media_manifest:
+        return prompt
+    return (
+        prompt
+        + "\n\nMultimodal attachment manifest:\n"
+        + media_manifest
+        + "\n\n"
+        + "Inspect the attached target paper directly when checking source "
+        + "alignment, figures, plots, tables, or paper-supported claims. Do "
+        + "not claim that the target paper is inaccessible unless the manifest "
+        + "says it was omitted or the model cannot parse it. Do not recommend "
+        + "adding PDF extraction tools or structured paper-parameter files "
+        + "solely to expose information that is already present in this "
+        + "attached target paper."
+    )
+
+
+def append_text_only_fallback_note(
+    prompt: str,
+    media_attachments: list[MediaAttachment],
+    media_omissions: list[str],
+) -> str:
+    if not media_attachments and not media_omissions:
+        return prompt
+    media_manifest = render_media_manifest([], media_omissions)
+    note = (
+        "\n\nMultimodal attachment manifest:\n"
+        "No target paper is attached in this fallback model request. Use the "
+        "extracted PDF text and file context included above; do not fail the "
+        "review solely because the fallback request is text-only."
+    )
+    if media_manifest:
+        note += "\n\n" + media_manifest
+    return prompt + note
+
+
+def review_call_attempts(
+    media_attachments: list[MediaAttachment],
+) -> list[tuple[str, bool]]:
+    if media_attachments:
+        return [
+            ("file", True),
+            ("file", False),
+            ("relay_image", True),
+            ("relay_image", False),
+            ("none", True),
+            ("none", False),
+        ]
+    return [("none", True), ("none", False)]
 
 
 def call_responses_model(
@@ -1042,6 +1099,7 @@ def call_responses_model(
     prompt: str,
     media_attachments: list[MediaAttachment],
     json_mode: bool,
+    attachment_mode: str,
 ) -> Any:
     content: list[dict[str, Any]] = [
         {
@@ -1060,13 +1118,7 @@ def call_responses_model(
                 ),
             }
         )
-        content.append(
-            {
-                "type": "input_image",
-                "image_base64": item.media_base64,
-                "mime_type": item.mime_type,
-            }
-        )
+        content.append(media_content_item(item, attachment_mode))
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -1076,6 +1128,22 @@ def call_responses_model(
     if json_mode:
         kwargs["text"] = {"format": {"type": "json_object"}}
     return client.responses.create(**kwargs)
+
+
+def media_content_item(item: MediaAttachment, attachment_mode: str) -> dict[str, Any]:
+    if attachment_mode == "file":
+        return {
+            "type": "input_file",
+            "filename": PurePosixPath(item.path).name,
+            "file_data": f"data:{item.mime_type};base64,{item.media_base64}",
+        }
+    if attachment_mode == "relay_image":
+        return {
+            "type": "input_image",
+            "image_base64": item.media_base64,
+            "mime_type": item.mime_type,
+        }
+    raise ValueError(f"Unsupported attachment mode: {attachment_mode}")
 
 
 def call_chat_model(client: OpenAI, model: str, prompt: str) -> Any:
