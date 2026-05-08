@@ -865,9 +865,10 @@ def build_review_prompt(
         Generic source inspection is not a required domain-tool feature here.
         Do not flag missing PDF/image parsing helpers, read_text limitations on
         binary PDFs, or missing structured paper-parameter files when the
-        original target paper itself is included and attached to this review.
-        Instead, evaluate whether the task, expected answer, data, tools, and
-        target paper are mutually consistent.
+        original target paper itself is included in the provided context,
+        extracted PDF text, or multimodal attachment. Instead, evaluate whether
+        the task, expected answer, data, tools, and target paper are mutually
+        consistent.
 
         For tools that are not general enough:
         - If the tool can be naturally split into reusable steps using the
@@ -921,6 +922,11 @@ def build_review_prompt(
         in the evidence strings. Keep the summary short and factual.
         Only report findings that fit the review dimensions above. If an issue
         is outside this scope, ignore it.
+
+        Even when you return no findings, explicitly state in `summary` or
+        `reasoning` whether the provided domain tools are sufficient for the
+        requested workflow, too weak, too one-shot, or not necessary for the
+        task. Mention the key relevant tool files/functions by path or name.
 
         Put the detailed rationale in `reasoning`. Put concise actionable TODOs
         in `todo_items`; these TODOs will be shown outside the folded detail
@@ -1031,6 +1037,9 @@ def call_review_model(
     media_attachments: list[MediaAttachment],
     media_omissions: list[str],
 ) -> dict[str, Any]:
+    if model_uses_text_only_review(model):
+        media_attachments = []
+
     prompt_with_media = append_media_manifest(
         prompt,
         media_attachments,
@@ -1209,6 +1218,10 @@ def model_supports_temperature(model: str) -> bool:
     return "claude" not in lowered and "anthropic" not in lowered
 
 
+def model_uses_text_only_review(model: str) -> bool:
+    return not model_supports_temperature(model)
+
+
 def run_pdf_smoke_tests(
     client: OpenAI,
     target: TaskTarget,
@@ -1232,6 +1245,8 @@ def run_pdf_smoke_tests(
     attachment = media_attachments[0]
     results = []
     for model in models:
+        if model_uses_text_only_review(model):
+            continue
         results.append(call_pdf_smoke_test(client, target, model, attachment))
     return results
 
@@ -1523,7 +1538,7 @@ def append_pdf_smoke_test_section(
             "",
             "## Temporary PDF Attachment Smoke Tests",
             "",
-            "These two extra model calls are temporary and are not part of the data review score.",
+            "This extra GPT model call is temporary and is not part of the data review score.",
         ]
     )
     for result in smoke_results:
