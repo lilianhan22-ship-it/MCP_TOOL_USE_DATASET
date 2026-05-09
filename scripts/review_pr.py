@@ -30,7 +30,7 @@ MAX_PDF_TEXT_CHARS = 40_000
 MAX_TOTAL_PROMPT_CHARS = 240_000
 MAX_MEDIA_BYTES = int(os.getenv("MAX_REVIEW_MEDIA_BYTES", str(25 * 1024 * 1024)))
 REVIEW_COMMENT_MARKER = "<!-- MCP_TOOL_USE_DATA_REVIEW -->"
-REVIEW_SCRIPT_VERSION = "pdf-smoke-v2"
+REVIEW_SCRIPT_VERSION = "tool-assessment-v1"
 
 TEXT_EXTENSIONS = {
     ".csv",
@@ -62,6 +62,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
         "benchmark_fit",
         "summary",
         "reasoning",
+        "tool_assessment",
         "findings",
         "merge_candidates",
         "todo_items",
@@ -84,6 +85,14 @@ REVIEW_SCHEMA: dict[str, Any] = {
         },
         "summary": {"type": "string"},
         "reasoning": {"type": "string"},
+        "tool_assessment": {
+            "type": "string",
+            "description": (
+                "Explicitly assess whether the provided domain tools are "
+                "sufficient, too weak, too one-shot, or unnecessary for the "
+                "requested workflow. Mention key tool files/functions."
+            ),
+        },
         "findings": {
             "type": "array",
             "items": {
@@ -923,9 +932,9 @@ def build_review_prompt(
         Only report findings that fit the review dimensions above. If an issue
         is outside this scope, ignore it.
 
-        Even when you return no findings, explicitly state in `summary` or
-        `reasoning` whether the provided domain tools are sufficient for the
-        requested workflow, too weak, too one-shot, or not necessary for the
+        Always fill `tool_assessment`, even when you return no findings.
+        Explicitly state whether the provided domain tools are sufficient for
+        the requested workflow, too weak, too one-shot, or not necessary for the
         task. Mention the key relevant tool files/functions by path or name.
 
         Put the detailed rationale in `reasoning`. Put concise actionable TODOs
@@ -1381,6 +1390,7 @@ def failed_review_record(target: TaskTarget, model: str, exc: BaseException) -> 
         "benchmark_fit": "poor",
         "summary": f"Automated review failed: {type(exc).__name__}: {exc}",
         "reasoning": "The reviewer could not complete because the model call or file collection failed.",
+        "tool_assessment": "Tool assessment was not produced because the automated review failed before completion.",
         "findings": [
             {
                 "severity": "high",
@@ -1407,6 +1417,7 @@ def normalize_record(target: TaskTarget, model: str, record: dict[str, Any]) -> 
         "benchmark_fit": str(record.get("benchmark_fit") or "poor"),
         "summary": str(record.get("summary") or ""),
         "reasoning": str(record.get("reasoning") or ""),
+        "tool_assessment": str(record.get("tool_assessment") or ""),
         "findings": findings,
         "merge_candidates": (
             record.get("merge_candidates")
@@ -1425,7 +1436,21 @@ def normalize_record(target: TaskTarget, model: str, record: dict[str, Any]) -> 
         normalized["overall_status"] = "needs_major_rework"
     if normalized["benchmark_fit"] not in {"good", "borderline", "poor"}:
         normalized["benchmark_fit"] = "poor"
+    if not normalized["tool_assessment"]:
+        normalized["tool_assessment"] = derive_tool_assessment(record)
     return normalized
+
+
+def derive_tool_assessment(record: dict[str, Any]) -> str:
+    summary = str(record.get("summary") or "").strip()
+    reasoning = str(record.get("reasoning") or "").strip()
+    combined = " ".join(part for part in [summary, reasoning] if part)
+    if combined:
+        return (
+            "No separate tool_assessment field was returned. Tool-related "
+            f"context from the model response: {combined}"
+        )
+    return "No tool assessment was returned by the model."
 
 
 def derive_todos(findings: list[dict[str, Any]]) -> list[str]:
@@ -1484,6 +1509,15 @@ def build_review_comment(
                 lines.append(f"- {escape_md(str(item))}")
         else:
             lines.append("- No TODOs returned.")
+        if record.get("tool_assessment"):
+            lines.extend(
+                [
+                    "",
+                    "**Tool Assessment**",
+                    "",
+                    escape_md(str(record["tool_assessment"])),
+                ]
+            )
         lines.extend(["", "<details>", "<summary>Reasoning and evidence</summary>", ""])
         if record.get("reasoning"):
             lines.extend(["**Reasoning**", "", escape_md(str(record["reasoning"])), ""])
