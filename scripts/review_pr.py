@@ -30,7 +30,7 @@ MAX_PDF_TEXT_CHARS = 40_000
 MAX_TOTAL_PROMPT_CHARS = 240_000
 MAX_MEDIA_BYTES = int(os.getenv("MAX_REVIEW_MEDIA_BYTES", str(25 * 1024 * 1024)))
 REVIEW_COMMENT_MARKER = "<!-- MCP_TOOL_USE_DATA_REVIEW -->"
-REVIEW_SCRIPT_VERSION = "tool-assessment-v1"
+SUPPORTED_REVIEW_MODELS = ("gpt-5.5", "claude-opus-4-7")
 
 TEXT_EXTENSIONS = {
     ".csv",
@@ -196,17 +196,6 @@ class MediaAttachment:
     media_base64: str
 
 
-@dataclass(frozen=True)
-class PdfSmokeTestResult:
-    task_id: str
-    model: str
-    target_path: str
-    attachment_path: str | None
-    attachment_mode: str
-    status: str
-    output: str
-
-
 def main() -> int:
     github_token = require_env("GITHUB_TOKEN")
     repo_name = require_env("REPO_NAME")
@@ -238,7 +227,6 @@ def main() -> int:
     llm_models = parse_review_models(os.getenv("LLM_REVIEW_MODELS"))
     client = OpenAI(api_key=llm_api_key, base_url=llm_base_url)
     records = []
-    smoke_results: list[PdfSmokeTestResult] = []
     for target in targets:
         try:
             snapshot = collect_target_snapshot(target, changed_files, head_repo, head_ref)
@@ -257,29 +245,12 @@ def main() -> int:
                 except Exception as exc:
                     record = failed_review_record(target, model, exc)
                 records.append(normalize_record(target, model, record))
-            smoke_results.extend(
-                run_pdf_smoke_tests(client, target, llm_models, media_attachments)
-            )
         except Exception as exc:
             for model in llm_models:
                 record = failed_review_record(target, model, exc)
                 records.append(normalize_record(target, model, record))
-                smoke_results.append(
-                    PdfSmokeTestResult(
-                        task_id=target.task_id,
-                        model=model,
-                        target_path=target.path,
-                        attachment_path=None,
-                        attachment_mode="not_run",
-                        status="failed",
-                        output=(
-                            "PDF smoke test was not run because file collection "
-                            f"failed: {type(exc).__name__}: {exc}"
-                        ),
-                    )
-                )
 
-    post_comment(pr, build_review_comment(pr_number, records, targets, smoke_results))
+    post_comment(pr, build_review_comment(pr_number, records, targets))
     return 0
 
 
@@ -294,10 +265,10 @@ def parse_review_models(raw: str | None) -> list[str]:
     aliases = {"claude-opus-4.7": "claude-opus-4-7"}
     models = []
     for item in (raw or "").split(","):
-        model = item.strip()
-        if model:
+        model = aliases.get(item.strip(), item.strip())
+        if model in SUPPORTED_REVIEW_MODELS and model not in models:
             models.append(aliases.get(model, model))
-    return models or ["gpt-5.5", "claude-opus-4-7"]
+    return models or list(SUPPORTED_REVIEW_MODELS)
 
 
 def detect_task_targets(
@@ -693,7 +664,7 @@ def build_review_prompt(
     schema_text = json.dumps(REVIEW_SCHEMA, indent=2)
     prompt = textwrap.dedent(
         f"""\
-        You are auditing a newly delivered MCP/ScienceToolBench raw task bundle
+        You are reviewing a newly delivered MCP/ScienceToolBench raw task bundle
         submitted through a GitHub pull request.
 
         Task ID: {target.task_id}
@@ -849,7 +820,7 @@ def build_review_prompt(
         uncertainty, or supporting evidence from the source.
 
         D. Tool and data support
-        Audit whether the provided domain-specific tools and released files can
+        Review whether the provided domain-specific tools and released files can
         support the task. Focus on:
         - Domain tools that are too weak, brittle, incomplete, or internally
           inconsistent for the instructed workflow.
@@ -1231,93 +1202,6 @@ def model_uses_text_only_review(model: str) -> bool:
     return not model_supports_temperature(model)
 
 
-def run_pdf_smoke_tests(
-    client: OpenAI,
-    target: TaskTarget,
-    models: list[str],
-    media_attachments: list[MediaAttachment],
-) -> list[PdfSmokeTestResult]:
-    if not media_attachments:
-        return [
-            PdfSmokeTestResult(
-                task_id=target.task_id,
-                model=model,
-                target_path=target.path,
-                attachment_path=None,
-                attachment_mode="not_run",
-                status="failed",
-                output="No target.pdf attachment was available for the PDF smoke test.",
-            )
-            for model in models
-        ]
-
-    attachment = media_attachments[0]
-    results = []
-    for model in models:
-        if model_uses_text_only_review(model):
-            continue
-        results.append(call_pdf_smoke_test(client, target, model, attachment))
-    return results
-
-
-def call_pdf_smoke_test(
-    client: OpenAI,
-    target: TaskTarget,
-    model: str,
-    attachment: MediaAttachment,
-) -> PdfSmokeTestResult:
-    errors = []
-    for attachment_mode in ("file", "relay_image"):
-        try:
-            response = call_pdf_smoke_model(client, model, attachment, attachment_mode)
-            return PdfSmokeTestResult(
-                task_id=target.task_id,
-                model=model,
-                target_path=target.path,
-                attachment_path=attachment.path,
-                attachment_mode=attachment_mode,
-                status="ok",
-                output=extract_response_text(response).strip(),
-            )
-        except Exception as exc:
-            errors.append(f"{attachment_mode}: {type(exc).__name__}: {exc}")
-
-    return PdfSmokeTestResult(
-        task_id=target.task_id,
-        model=model,
-        target_path=target.path,
-        attachment_path=attachment.path,
-        attachment_mode="failed",
-        status="failed",
-        output="PDF attachment smoke test failed for all attachment modes:\n"
-        + "\n".join(f"- {error}" for error in errors),
-    )
-
-
-def call_pdf_smoke_model(
-    client: OpenAI,
-    model: str,
-    attachment: MediaAttachment,
-    attachment_mode: str,
-) -> Any:
-    content = [
-        {
-            "type": "input_text",
-            "text": (
-                "Read only the attached PDF. Translate the paper abstract into "
-                "Chinese. If you cannot access or read the attached PDF, say so "
-                "explicitly and briefly."
-            ),
-        },
-        media_content_item(attachment, attachment_mode),
-    ]
-    kwargs = {
-        "model": model,
-        "input": [{"role": "user", "content": content}],
-    }
-    return client.responses.create(**kwargs)
-
-
 def extract_response_text(response: Any) -> str:
     if isinstance(response, dict):
         output_text = response.get("output_text")
@@ -1383,13 +1267,17 @@ def parse_json_response(text: str) -> dict[str, Any]:
 
 
 def failed_review_record(target: TaskTarget, model: str, exc: BaseException) -> dict[str, Any]:
+    print(
+        f"Automated review failed for {target.kind}:{target.path} "
+        f"with model {model}: {type(exc).__name__}: {exc}"
+    )
     return {
         "task_id": target.task_id,
         "model": model,
         "overall_status": "needs_major_rework",
         "benchmark_fit": "poor",
-        "summary": f"Automated review failed: {type(exc).__name__}: {exc}",
-        "reasoning": "The reviewer could not complete because the model call or file collection failed.",
+        "summary": "Automated review failed for this model.",
+        "reasoning": "The reviewer could not complete. Please inspect the GitHub Actions log and rerun the workflow.",
         "tool_assessment": "Tool assessment was not produced because the automated review failed before completion.",
         "findings": [
             {
@@ -1412,7 +1300,7 @@ def normalize_record(target: TaskTarget, model: str, record: dict[str, Any]) -> 
         todo_items = derive_todos(findings)
     normalized = {
         "task_id": str(record.get("task_id") or target.task_id),
-        "model": str(record.get("model") or model),
+        "model": model,
         "overall_status": str(record.get("overall_status") or "needs_major_rework"),
         "benchmark_fit": str(record.get("benchmark_fit") or "poor"),
         "summary": str(record.get("summary") or ""),
@@ -1469,13 +1357,10 @@ def build_review_comment(
     pr_number: int,
     records: list[dict[str, Any]],
     targets: list[TaskTarget],
-    smoke_results: list[PdfSmokeTestResult],
 ) -> str:
     lines = [
         REVIEW_COMMENT_MARKER,
         f"## MCP Tool Use Data Review for PR #{pr_number}",
-        "",
-        f"Reviewer script version: `{REVIEW_SCRIPT_VERSION}`",
         "",
         "| Task | Model | Target | Status | Fit | High | Medium | Low | Summary |",
         "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
@@ -1497,8 +1382,6 @@ def build_review_comment(
                 summary=escape_md(record["summary"].replace("\n", " ")),
             )
         )
-
-    append_pdf_smoke_test_section(lines, smoke_results)
 
     for record in records:
         lines.extend(["", f"### {record['task_id']} / `{escape_md(record['model'])}`", ""])
@@ -1561,43 +1444,6 @@ def build_review_comment(
     return "\n".join(lines)
 
 
-def append_pdf_smoke_test_section(
-    lines: list[str],
-    smoke_results: list[PdfSmokeTestResult],
-) -> None:
-    if not smoke_results:
-        return
-    lines.extend(
-        [
-            "",
-            "## Temporary PDF Attachment Smoke Tests",
-            "",
-            "This extra GPT model call is temporary and is not part of the data review score.",
-        ]
-    )
-    for result in smoke_results:
-        lines.extend(
-            [
-                "",
-                f"### PDF smoke test: {escape_md(result.task_id)} / `{escape_md(result.model)}`",
-                "",
-                f"- Status: `{escape_md(result.status)}`",
-                f"- Attachment mode: `{escape_md(result.attachment_mode)}`",
-                f"- Target: `{escape_md(result.target_path)}`",
-                f"- Attachment: `{escape_md(result.attachment_path or '(none)')}`",
-                "",
-                "<details>",
-                "<summary>Translated abstract smoke-test output</summary>",
-                "",
-                "```text",
-                trim_comment_text(result.output, 6_000),
-                "```",
-                "",
-                "</details>",
-            ]
-        )
-
-
 def build_no_target_comment(pr_number: int, changed_files: list[ChangedFile]) -> str:
     changed = "\n".join(f"- {item.status}: `{item.path}`" for item in changed_files[:100])
     return "\n".join(
@@ -1628,14 +1474,16 @@ def escape_md(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
-def trim_comment_text(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n\n...[truncated]..."
-
-
 def post_comment(pr: Any, body: str) -> None:
     body = body[:60_000]
+    marker_comments = [
+        comment
+        for comment in pr.get_issue_comments()
+        if REVIEW_COMMENT_MARKER in (comment.body or "")
+    ]
+    if marker_comments:
+        marker_comments[-1].edit(body)
+        return
     pr.create_issue_comment(body)
 
 
