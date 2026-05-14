@@ -62,7 +62,6 @@ REVIEW_SCHEMA: dict[str, Any] = {
         "benchmark_fit",
         "summary",
         "reasoning",
-        "tool_assessment",
         "findings",
         "merge_candidates",
         "todo_items",
@@ -85,14 +84,6 @@ REVIEW_SCHEMA: dict[str, Any] = {
         },
         "summary": {"type": "string"},
         "reasoning": {"type": "string"},
-        "tool_assessment": {
-            "type": "string",
-            "description": (
-                "Explicitly assess whether the provided domain tools are "
-                "sufficient, too weak, too one-shot, or unnecessary for the "
-                "requested workflow. Mention key tool files/functions."
-            ),
-        },
         "findings": {
             "type": "array",
             "items": {
@@ -676,6 +667,11 @@ def build_review_prompt(
         the web. Do not ask for more information. Do not suggest running
         project code.
 
+        All user-facing text in the returned JSON must be Chinese. This
+        includes `summary`, `reasoning`, finding titles/evidence/actions,
+        merge-candidate reasons, and `todo_items`. File paths, function names,
+        model names, and status enum values may remain as literals.
+
         Changed files in this PR:
         {changed_context}
 
@@ -714,7 +710,7 @@ def build_review_prompt(
            not rejecting tasks just because a strong model could also solve
            parts with code. Focus on whether the released data and tools support
            the requested scientific work.
-        5. Do not over-audit expected answer formatting, uniqueness, or numeric
+        5. Do not over-review expected answer formatting, uniqueness, or numeric
            tolerance. For answers/checklists, only check whether they capture
            the core conclusion(s) and core figure/artifact point(s) that reflect
            the main finding asked by the task.
@@ -903,10 +899,11 @@ def build_review_prompt(
         Only report findings that fit the review dimensions above. If an issue
         is outside this scope, ignore it.
 
-        Always fill `tool_assessment`, even when you return no findings.
-        Explicitly state whether the provided domain tools are sufficient for
-        the requested workflow, too weak, too one-shot, or not necessary for the
-        task. Mention the key relevant tool files/functions by path or name.
+        Always include the tool assessment inside `summary` or `reasoning`, even
+        when you return no findings. Explicitly state whether the provided
+        domain tools are sufficient for the requested workflow, too weak, too
+        one-shot, or not necessary for the task. Mention the key relevant tool
+        files/functions by path or name.
 
         Put the detailed rationale in `reasoning`. Put concise actionable TODOs
         in `todo_items`; these TODOs will be shown outside the folded detail
@@ -1169,7 +1166,7 @@ def call_chat_model(client: OpenAI, model: str, prompt: str) -> Any:
     messages = [
         {
             "role": "system",
-            "content": "You are a strict benchmark data reviewer. Return JSON only.",
+            "content": "You are a strict benchmark data reviewer. Return JSON only. All user-facing text fields must be Chinese.",
         },
         {"role": "user", "content": prompt},
     ]
@@ -1276,20 +1273,19 @@ def failed_review_record(target: TaskTarget, model: str, exc: BaseException) -> 
         "model": model,
         "overall_status": "needs_major_rework",
         "benchmark_fit": "poor",
-        "summary": "Automated review failed for this model.",
-        "reasoning": "The reviewer could not complete. Please inspect the GitHub Actions log and rerun the workflow.",
-        "tool_assessment": "Tool assessment was not produced because the automated review failed before completion.",
+        "summary": "该模型的自动审查未能完成。",
+        "reasoning": "审查流程未能完成。请查看 GitHub Actions 日志后重新运行工作流。",
         "findings": [
             {
                 "severity": "high",
                 "category": "other",
-                "title": "Automated review failed",
+                "title": "自动审查失败",
                 "evidence": [f"target={target.kind}:{target.path}"],
-                "recommended_action": "Inspect the GitHub Actions log and rerun the review.",
+                "recommended_action": "查看 GitHub Actions 日志并重新运行审查。",
             }
         ],
         "merge_candidates": [],
-        "todo_items": ["Fix the review execution issue and rerun the workflow."],
+        "todo_items": ["修复审查执行问题后重新运行工作流。"],
     }
 
 
@@ -1305,7 +1301,6 @@ def normalize_record(target: TaskTarget, model: str, record: dict[str, Any]) -> 
         "benchmark_fit": str(record.get("benchmark_fit") or "poor"),
         "summary": str(record.get("summary") or ""),
         "reasoning": str(record.get("reasoning") or ""),
-        "tool_assessment": str(record.get("tool_assessment") or ""),
         "findings": findings,
         "merge_candidates": (
             record.get("merge_candidates")
@@ -1324,21 +1319,7 @@ def normalize_record(target: TaskTarget, model: str, record: dict[str, Any]) -> 
         normalized["overall_status"] = "needs_major_rework"
     if normalized["benchmark_fit"] not in {"good", "borderline", "poor"}:
         normalized["benchmark_fit"] = "poor"
-    if not normalized["tool_assessment"]:
-        normalized["tool_assessment"] = derive_tool_assessment(record)
     return normalized
-
-
-def derive_tool_assessment(record: dict[str, Any]) -> str:
-    summary = str(record.get("summary") or "").strip()
-    reasoning = str(record.get("reasoning") or "").strip()
-    combined = " ".join(part for part in [summary, reasoning] if part)
-    if combined:
-        return (
-            "No separate tool_assessment field was returned. Tool-related "
-            f"context from the model response: {combined}"
-        )
-    return "No tool assessment was returned by the model."
 
 
 def derive_todos(findings: list[dict[str, Any]]) -> list[str]:
@@ -1350,7 +1331,7 @@ def derive_todos(findings: list[dict[str, Any]]) -> list[str]:
             todos.append(f"{title}: {action}")
         elif action:
             todos.append(action)
-    return todos or ["No blocking TODOs identified by this reviewer."]
+    return todos or ["未发现阻塞性 TODO。"]
 
 
 def build_review_comment(
@@ -1360,9 +1341,9 @@ def build_review_comment(
 ) -> str:
     lines = [
         REVIEW_COMMENT_MARKER,
-        f"## MCP Tool Use Data Review for PR #{pr_number}",
+        f"## MCP Tool Use 数据审查：PR #{pr_number}",
         "",
-        "| Task | Model | Target | Status | Fit | High | Medium | Low | Summary |",
+        "| 任务 | 模型 | 目标 | 状态 | 适配度 | High | Medium | Low | 摘要 |",
         "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
     ]
     for record in records:
@@ -1391,24 +1372,15 @@ def build_review_comment(
             for item in todo_items:
                 lines.append(f"- {escape_md(str(item))}")
         else:
-            lines.append("- No TODOs returned.")
-        if record.get("tool_assessment"):
-            lines.extend(
-                [
-                    "",
-                    "**Tool Assessment**",
-                    "",
-                    escape_md(str(record["tool_assessment"])),
-                ]
-            )
-        lines.extend(["", "<details>", "<summary>Reasoning and evidence</summary>", ""])
+            lines.append("- 未返回 TODO。")
+        lines.extend(["", "<details>", "<summary>审查理由与证据</summary>", ""])
         if record.get("reasoning"):
-            lines.extend(["**Reasoning**", "", escape_md(str(record["reasoning"])), ""])
+            lines.extend(["**理由**", "", escape_md(str(record["reasoning"])), ""])
         if record.get("summary"):
-            lines.extend(["**Summary**", "", escape_md(str(record["summary"])), ""])
+            lines.extend(["**摘要**", "", escape_md(str(record["summary"])), ""])
         findings = record.get("findings", [])
         if findings:
-            lines.append("**Findings**")
+            lines.append("**问题**")
             for finding in findings:
                 lines.append(
                     "- [{severity}] [{category}] {title}: {action}".format(
@@ -1421,11 +1393,11 @@ def build_review_comment(
                 for evidence in finding.get("evidence", [])[:5]:
                     lines.append(f"  - Evidence: `{escape_md(str(evidence))}`")
         else:
-            lines.append("**Findings**: None")
+            lines.append("**问题**：无")
 
         merge_candidates = record.get("merge_candidates", [])
         if merge_candidates:
-            lines.extend(["", "**Merge Candidates**"])
+            lines.extend(["", "**可合并工具候选**"])
             for candidate in merge_candidates[:8]:
                 lines.append(
                     "- `{action}` from `{source}` to `{target}`: {reason}".format(
@@ -1449,13 +1421,13 @@ def build_no_target_comment(pr_number: int, changed_files: list[ChangedFile]) ->
     return "\n".join(
         [
             REVIEW_COMMENT_MARKER,
-            f"## MCP Tool Use Data Review for PR #{pr_number}",
+            f"## MCP Tool Use 数据审查：PR #{pr_number}",
             "",
-            "No MCP task bundle was detected in this PR.",
+            "未在该 PR 中检测到 MCP task bundle。",
             "",
-            "Detected task targets are either raw task zip files or directories containing `task_content/task_content.json`.",
+            "可检测的任务目标应为 raw task zip 文件，或包含 `task_content/task_content.json` 的目录。",
             "",
-            "Changed files:",
+            "变更文件：",
             changed or "(none)",
         ]
     )
